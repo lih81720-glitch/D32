@@ -1,0 +1,33 @@
+from __future__ import annotations
+import json
+from pathlib import Path
+from config import DUCKDB_TEMP, HIRID_MAP_GLOB, HIRID_ROOT, RESULTS_DIR, SICDB_ROOT
+import duckdb
+ROOT = HIRID_ROOT
+OUT = RESULTS_DIR
+PHARMA_GLOB = str(ROOT / 'raw_stage' / 'pharma_records' / 'csv' / 'part-*.csv').replace('\\', '/')
+OBS_GLOB = str(ROOT / 'raw_stage' / 'observation_tables' / 'csv' / 'part-*.csv').replace('\\', '/')
+CSV_COLUMNS = "{patientid: 'INTEGER', pharmaid: 'INTEGER', givenat: 'TIMESTAMP', enteredentryat: 'TIMESTAMP', givendose: 'DOUBLE', cumulativedose: 'DOUBLE', fluidamount_calc: 'DOUBLE', cumulfluidamount_calc: 'DOUBLE', doseunit: 'VARCHAR', route: 'VARCHAR', infusionid: 'VARCHAR', typeid: 'INTEGER', subtypeid: 'DOUBLE', recordstatus: 'INTEGER'}"
+OBS_COLUMNS = "{datetime: 'TIMESTAMP', entertime: 'TIMESTAMP', patientid: 'INTEGER', status: 'INTEGER', stringvalue: 'VARCHAR', type: 'VARCHAR', value: 'DOUBLE', variableid: 'INTEGER'}"
+MET_ID = 1000605
+PARA_IDS = (1000489, 1000490)
+NE_IDS = (1000462, 1000656, 1000657, 1000658)
+PRESSORS = NE_IDS + (71, 1000750, 1000649, 1000650, 1000655, 112, 113)
+con = duckdb.connect()
+con.execute("SET memory_limit='768MB'")
+con.execute('SET threads=2')
+con.execute('SET preserve_insertion_order=false')
+con.execute(f"SET temp_directory='{DUCKDB_TEMP.as_posix()}'")
+con.execute(f"\nCREATE TEMP TABLE target AS\nSELECT ROW_NUMBER() OVER () AS target_id, patientid::INTEGER AS patientid,\n       pharmaid::INTEGER AS pharmaid,\n       CASE WHEN pharmaid={MET_ID} THEN 'metamizole' ELSE 'paracetamol' END AS drug,\n       givenat::TIMESTAMP AS givenat, infusionid::VARCHAR AS infusionid\nFROM read_csv('{PHARMA_GLOB}', union_by_name=true, header=true, columns={CSV_COLUMNS}, ignore_errors=true)\nWHERE pharmaid IN ({MET_ID},{PARA_IDS[0]},{PARA_IDS[1]})\n  AND givenat IS NOT NULL AND givendose > 0\n  AND route IN ('iv-inj','iv-inf','cv-inj','cv-inf')\n  AND (recordstatus & 2)=0 AND (recordstatus & 32)=0\n")
+con.execute(f"\nCREATE TEMP TABLE pressor_raw AS\nSELECT patientid::INTEGER AS patientid, pharmaid::INTEGER AS pharmaid,\n       givenat::TIMESTAMP AS givenat, givendose::DOUBLE AS givendose,\n       infusionid::VARCHAR AS infusionid,\n       LAG(givenat) OVER (PARTITION BY patientid, infusionid ORDER BY givenat) AS prev_at\nFROM read_csv('{PHARMA_GLOB}', union_by_name=true, header=true, columns={CSV_COLUMNS}, ignore_errors=true)\nWHERE pharmaid IN {PRESSORS} AND givenat IS NOT NULL AND givendose > 0\n  AND route IN ('cv-inf','iv-inf') AND (recordstatus & 2)=0 AND (recordstatus & 32)=0\n")
+con.execute('\nCREATE TEMP TABLE pressor_intervals AS\nSELECT *,\n       CASE WHEN prev_at IS NOT NULL AND EPOCH(givenat-prev_at)>0\n                  AND EPOCH(givenat-prev_at)<=1800\n            THEN givendose/(EPOCH(givenat-prev_at)/60.0) END AS dose_rate_ug_min,\n       CASE WHEN LEAD(givenat) OVER (PARTITION BY patientid, infusionid ORDER BY givenat) IS NOT NULL\n                  AND LEAD(givenat) OVER (PARTITION BY patientid, infusionid ORDER BY givenat) <= givenat+INTERVAL 15 MINUTE\n            THEN LEAD(givenat) OVER (PARTITION BY patientid, infusionid ORDER BY givenat)\n            ELSE givenat+INTERVAL 10 MINUTE END AS stop_at\nFROM pressor_raw\n')
+con.execute(f"\nCREATE TEMP TABLE weight_obs AS\nSELECT patientid::INTEGER AS patientid, datetime::TIMESTAMP AS datetime, value::DOUBLE AS weight_kg\nFROM read_csv('{OBS_GLOB}', union_by_name=true, header=true, columns={OBS_COLUMNS}, ignore_errors=true)\nWHERE variableid=10000400 AND value BETWEEN 20 AND 300\n")
+con.execute('\nCREATE TEMP TABLE annotated AS\nWITH seq AS (\n  SELECT t.*, LAG(drug) OVER (PARTITION BY patientid ORDER BY givenat, target_id) AS previous_drug\n  FROM target t\n), dose AS (\n  SELECT s.target_id,\n         w.weight_kg,\n         n0.dose_rate_ug_min/NULLIF(w.weight_kg,0) AS ne_current,\n         n30.dose_rate_ug_min/NULLIF(w.weight_kg,0) AS ne_30m\n  FROM seq s\n  LEFT JOIN LATERAL (\n    SELECT weight_kg FROM weight_obs w\n    WHERE w.patientid=s.patientid AND w.datetime<=s.givenat AND w.datetime>=s.givenat-INTERVAL 7 DAY\n    ORDER BY w.datetime DESC LIMIT 1\n  ) w ON TRUE\n  LEFT JOIN LATERAL (\n    SELECT dose_rate_ug_min FROM pressor_intervals p\n    WHERE p.patientid=s.patientid AND p.pharmaid IN (1000462,1000656,1000657,1000658)\n      AND p.givenat<=s.givenat AND p.givenat>s.givenat-INTERVAL 30 MINUTE AND p.dose_rate_ug_min IS NOT NULL\n    ORDER BY p.givenat DESC LIMIT 1\n  ) n0 ON TRUE\n  LEFT JOIN LATERAL (\n    SELECT dose_rate_ug_min FROM pressor_intervals p\n    WHERE p.patientid=s.patientid AND p.pharmaid IN (1000462,1000656,1000657,1000658)\n      AND p.givenat<=s.givenat-INTERVAL 30 MINUTE AND p.givenat>s.givenat-INTERVAL 60 MINUTE AND p.dose_rate_ug_min IS NOT NULL\n    ORDER BY p.givenat DESC LIMIT 1\n  ) n30 ON TRUE\n)\nSELECT s.*, CASE WHEN EXISTS (\n  SELECT 1 FROM pressor_intervals p\n  WHERE p.patientid=s.patientid AND p.givenat<=s.givenat AND s.givenat<p.stop_at\n) THEN 1 ELSE 0 END AS pressor_active,\n       d.weight_kg, d.ne_current, d.ne_30m,\n       CASE WHEN d.ne_current IS NOT NULL AND d.ne_30m IS NOT NULL THEN d.ne_current-d.ne_30m END AS ne_change_pre30\nFROM seq s LEFT JOIN dose d ON d.target_id=s.target_id\n')
+
+def stats(where: str) -> dict:
+    row = con.execute(f'\n    SELECT COUNT(*) AS n, COUNT(DISTINCT patientid) AS patients,\n           AVG(ne_current) AS ne_mean, MEDIAN(ne_current) AS ne_median,\n           AVG(ne_change_pre30) AS change_mean, MEDIAN(ne_change_pre30) AS change_median,\n           STDDEV_SAMP(ne_current) AS ne_sd, STDDEV_SAMP(ne_change_pre30) AS change_sd,\n           COUNT(ne_current) AS ne_n, COUNT(ne_change_pre30) AS change_n\n    FROM annotated WHERE pressor_active=1 AND {where}\n    ').fetchone()
+    cols = [d[0] for d in con.description]
+    return dict(zip(cols, row))
+result = {'dataset': 'HiRID 1.1.1', 'definition': 'pressor-active target administrations; switch means previous target drug differs, repeat means it is the same; NE dose reconstructed with the same infusion and weight rules as the formal pressor analysis', 'baseline_by_current_drug': {'metamizole': stats("drug='metamizole' AND previous_drug IS NOT NULL AND previous_drug<>drug"), 'paracetamol': stats("drug='paracetamol' AND previous_drug IS NOT NULL AND previous_drug<>drug")}, 'sequence_disruption_by_ne_state': {'switch': stats('previous_drug IS NOT NULL AND previous_drug<>drug'), 'repeat': stats('previous_drug IS NOT NULL AND previous_drug=drug')}}
+(OUT / 'hirid_metamizole_pressor_balance_audit.json').write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str), encoding='utf-8')
+print(json.dumps(result, indent=2, ensure_ascii=True, default=str))

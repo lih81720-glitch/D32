@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.duckdb_tmp/
+data/
+results/
+*.parquet
+*.csv
+*.csv.gz
+*.json
+*.png
+
